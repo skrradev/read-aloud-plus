@@ -1,0 +1,9 @@
+{
+  "name": "read-aloud-plus-for-claude",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Chrome extension: word highlighting and pitch-preserving speed control for Claude's Read aloud.",
+  "scripts": {
+    "test": "node test/stretch-test.js && SR=16000 node test/stretch-test.js && node test/align-fixture.js --stream"
+  }
+}

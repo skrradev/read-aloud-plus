@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Read Aloud+ settings</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img src="../icons/icon48.png" alt="" width="24" height="24">
+    <h1>Read Aloud+</h1>
+  </header>
+
+  <section>
+    <label class="row" for="speed">
+      <span>Speed</span>
+      <output id="speedOut">1.0×</output>
+    </label>
+    <input id="speed" type="range" min="0" max="17" step="1" aria-describedby="speedHint">
+    <p id="speedHint" class="hint">While reading: <kbd>Shift</kbd>+<kbd>,</kbd> slower, <kbd>Shift</kbd>+<kbd>.</kbd> faster</p>
+
+    <label class="row toggle">
+      <span>Smart speed <small>pitch-preserving; required for speed changes</small></span>
+      <input id="smartSpeed" type="checkbox">
+    </label>
+  </section>
+
+  <section>
+    <label class="row toggle"><span>Highlight current word</span><input id="highlightWord" type="checkbox"></label>
+    <label class="row toggle"><span>Highlight current sentence</span><input id="highlightSentence" type="checkbox"></label>
+    <label class="row toggle"><span>Follow along (auto-scroll)</span><input id="autoScroll" type="checkbox"></label>
+    <label class="row toggle"><span>Show floating controls</span><input id="showControls" type="checkbox"></label>
+
+    <fieldset>
+      <legend>Highlight color</legend>
+      <div id="colors" class="swatches"></div>
+    </fieldset>
+  </section>
+
+  <p class="hint">Press <strong>Read aloud</strong> under any Claude reply. Changes apply instantly.</p>
+  <script src="../src/defaults.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

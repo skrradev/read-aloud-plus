@@ -17,44 +17,13 @@
 //  - highlight the word being spoken in the message.
 (() => {
   'use strict';
-  if (window.__readAloudPlusLoaded) return;
-  window.__readAloudPlusLoaded = true;
+  if (window.__readAloudPlusClaude) return;
+  window.__readAloudPlusClaude = true;
 
-  const { Aligner, BRK_SENTENCE } = window.ReadAloudAligner;
+  const Core = window.ReadAloudCore;
+  const { settings, log } = Core;
+  const { Aligner } = window.ReadAloudAligner;
   const { Stretcher } = window.ReadAloudStretcher;
-  const { MessageText, Highlighter, mappedRatio } = window.ReadAloudText;
-
-  const SPEEDS = [0.5, 0.6, 0.7, 0.75, 0.8, 0.9, 1, 1.1, 1.2, 1.25, 1.3, 1.4, 1.5, 1.6, 1.75, 2, 2.25, 2.5];
-
-  // ---------------------------------------------------------------- settings
-  const settings = {
-    smartSpeed: true,
-    speed: 1,
-    highlightWord: true,
-    highlightSentence: true,
-    autoScroll: true,
-    showControls: true,
-    wordColor: '#ffd54a',
-    wordText: '#1a1a1a',
-    sentenceColor: 'rgba(255, 213, 74, 0.22)',
-    debug: false,
-  };
-  const log = (...a) => { if (settings.debug) console.debug('[ReadAloud+]', ...a); };
-
-  function applySettings(patch) {
-    Object.assign(settings, patch);
-    highlighter?.setColors(settings);
-    if (current?.engine) current.engine.setRate(settings.speed);
-    ui?.render();
-    if (current) current.lastWord = -2; // force repaint
-  }
-  function saveSettings(patch) {
-    applySettings(patch);
-    document.dispatchEvent(new CustomEvent('readaloudplus:save', { detail: JSON.stringify(patch) }));
-  }
-  document.addEventListener('readaloudplus:settings', e => {
-    try { applySettings(JSON.parse(e.detail)); } catch (err) { console.warn('[ReadAloud+] bad settings', err); }
-  });
 
   // ------------------------------------------------------------ audio hooks
   const AC = window.BaseAudioContext || window.AudioContext;
@@ -69,7 +38,7 @@
   const sessionByCtx = new WeakMap();
   const ctxOffset = new WeakMap(); // clock offset left behind by finished sessions
   let pending = null; // session whose WebSocket opened but has no audio yet
-  let current = null; // session being played/highlighted
+  let playing = null; // session bound to an AudioContext
 
   AudioNode.prototype.connect = function (dest, ...rest) {
     if (this instanceof AudioBufferSourceNode && dest instanceof AudioNode) destOf.set(this, dest);
@@ -122,6 +91,10 @@
       p.bind(ctx, destOf.get(node) || ctx.destination);
       return p;
     }
+    if (p && !p.loggedMismatch) {
+      p.loggedMismatch = true;
+      log('audio chunk not matched to read', { expected: p.sampleRate, buffer: node.buffer?.sampleRate, ctx: ctx.sampleRate, channels: node.buffer?.numberOfChannels });
+    }
     return null;
   }
 
@@ -140,11 +113,11 @@
     const q = new URL(url, location.href).searchParams;
     if (q.has('resume_token')) {
       // Claude reconnecting mid-read; same audio stream continues.
-      const s = current || pending;
+      const s = playing || pending;
       if (s) { s.sockets++; ws.addEventListener('close', () => s.onSocketClosed()); }
       return;
     }
-    const s = new Session({
+    const s = new ClaudeSession({
       format: q.get('output_format') || '',
       voice: q.get('voice') || '',
       ttsSpeed: q.get('tts_speed') || '1',
@@ -175,8 +148,9 @@
   }, true);
 
   // ---------------------------------------------------------------- session
-  class Session {
+  class ClaudeSession extends Core.Session {
     constructor(info) {
+      super();
       this.info = info;
       this.sampleRate = /^opus/.test(info.format) ? 48000 : (parseInt(info.format.split('_')[1], 10) || 16000);
       this.mode = settings.smartSpeed ? 'smart' : 'passive';
@@ -184,14 +158,8 @@
       this.ctx = null;
       this.chunks = [];
       this.inTotal = 0;
-      this.active = true;
       this.sockets = 1;
       this.socketsClosed = 0;
-      this.aligner = null;
-      this.message = null;
-      this.wordMap = null;
-      this.lastWord = -2;
-      this.lastAlignAt = 0;
       this.virtLast = 0;
       this.baseOffset = 0;
     }
@@ -214,16 +182,12 @@
       this.baseOffset = ctxOffset.get(ctx) || 0;
       this.virtLast = realTime(ctx) + this.baseOffset;
       sessionByCtx.set(ctx, this);
-      if (current && current !== this) current.end('superseded');
-      current = this;
       this.aligner = new Aligner(this.texts.join(' '));
-      try {
-        const prior = parseFloat(localStorage.getItem(this.rateKey));
-        if (prior > 0.02 && prior < 0.2) this.aligner.priorSecPerUnit = this.aligner.secPerUnit = prior;
-      } catch {}
+      this.recallRate(this.rateKey);
       if (this.mode === 'smart') this.engine = new Engine(this, ctx, dest);
-      ui.show();
-      startFrameLoop();
+      if (playing && playing !== this) playing.end('superseded');
+      playing = this;
+      Core.start(this);
       log('bound to context', ctx.sampleRate, this.mode);
     }
 
@@ -302,70 +266,17 @@
       return -1;
     }
 
-    ensureMessage() {
-      if (this.message && !this.message.isStale()) return true;
-      const words = this.aligner.words;
-      if (!words.length || performance.now() - (this.matchFailedAt || -1e9) < 2000) return false;
-      const candidates = [];
-      if (lastClick && performance.now() - lastClick.at < 15000 && lastClick.msg.isConnected) candidates.push(lastClick.msg);
-      if (this.messageEl?.isConnected) candidates.unshift(this.messageEl);
-      let best = null;
-      const consider = el => {
-        const mt = new MessageText(el);
-        const map = mt.mapSpoken(words);
-        const r = mappedRatio(map);
-        if (!best || r > best.r) best = { mt, map, r, el };
-      };
-      for (const el of candidates) consider(el);
-      if (!best || best.r < 0.5) {
-        for (const el of document.querySelectorAll('[data-testid="assistant-message"]')) {
-          if (!candidates.includes(el)) consider(el);
-        }
-      }
-      if (!best || best.r < 0.3) { this.matchFailedAt = performance.now(); return false; }
-      this.message = best.mt;
-      this.messageEl = best.el;
-      this.wordMap = best.map;
-      // Sentence spans over spoken words.
-      this.sentenceOf = new Int32Array(words.length);
-      let start = 0;
-      for (let i = 0; i < words.length; i++) {
-        this.sentenceOf[i] = start;
-        if (words[i].brk === BRK_SENTENCE) start = i + 1;
-      }
-      log('message matched', Math.round(best.r * 100) + '% of words');
-      return true;
-    }
-
-    tick() {
-      if (!this.active || !this.aligner) return;
-      const now = performance.now();
-      if (this.aligner.dirty && now - this.lastAlignAt > 400) {
-        this.lastAlignAt = now;
-        this.aligner.align();
-      }
-      if (!this.aligner.wordTimes) return;
+    audibleSec() {
       const p = this.audiblePos();
-      const w = p < 0 ? -1 : this.aligner.wordAt(p / this.sampleRate);
-      if (w === this.lastWord) return;
-      this.lastWord = w;
-      if (w < 0 || !this.ensureMessage()) { highlighter.clear(); return; }
-      const domIdx = this.wordMap[w];
-      let wordRange = null;
-      let sentenceRange = null;
-      if (domIdx >= 0 && settings.highlightWord) wordRange = this.message.rangeFor(domIdx, domIdx);
-      if (settings.highlightSentence) {
-        const s0 = this.sentenceOf[w];
-        let s1 = s0;
-        while (s1 + 1 < this.wordMap.length && this.sentenceOf[s1 + 1] === s0) s1++;
-        let a = -1, b = -1;
-        for (let i = s0; i <= s1; i++) if (this.wordMap[i] >= 0) { a = this.wordMap[i]; break; }
-        for (let i = s1; i >= s0; i--) if (this.wordMap[i] >= 0) { b = this.wordMap[i]; break; }
-        if (a >= 0 && b >= a) sentenceRange = this.message.rangeFor(a, b);
-      }
-      highlighter.show(wordRange, sentenceRange);
-      if (settings.autoScroll) highlighter.scrollIntoView(wordRange || sentenceRange);
+      return p < 0 ? -1 : p / this.sampleRate;
     }
+    isPaused() { return this.ctx?.state === 'suspended'; }
+    canChangeSpeed() { return this.mode === 'smart'; }
+    setRate(r) { this.engine?.setRate(r); }
+    candidateMessages() {
+      return lastClick && performance.now() - lastClick.at < 15000 ? [lastClick.msg] : [];
+    }
+    allMessages() { return document.querySelectorAll('[data-testid="assistant-message"]'); }
 
     // Everything played: Claude has already been told each chunk ended.
     end(reason) {
@@ -379,14 +290,9 @@
           : this.baseOffset);
         sessionByCtx.delete(this.ctx);
       }
-      if (this.aligner && this.aligner.audioDuration > 25 && this.aligner.lastRho) {
-        try { localStorage.setItem(this.rateKey, String(this.aligner.lastRho)); } catch {}
-      }
-      if (current === this) {
-        current = null;
-        highlighter.clear();
-        ui.hide();
-      }
+      this.rememberRate(this.rateKey);
+      if (playing === this) playing = null;
+      Core.finish(this);
     }
   }
 
@@ -514,119 +420,4 @@
       this.live.clear();
     }
   }
-
-  // ------------------------------------------------------------ frame loop
-  let loopRunning = false;
-  function startFrameLoop() {
-    if (loopRunning) return;
-    loopRunning = true;
-    const step = () => {
-      if (!current) { loopRunning = false; return; }
-      try { current.tick(); ui.syncPaused(); } catch (err) { console.warn('[ReadAloud+]', err); }
-      if (document.hidden) setTimeout(step, 250); else requestAnimationFrame(step);
-    };
-    requestAnimationFrame(step);
-  }
-
-  // ---------------------------------------------------------- speed control
-  const formatSpeed = x => `${x.toFixed(Math.round(x * 100) % 10 ? 2 : 1)}×`;
-
-  function stepSpeed(dir) {
-    const cur = settings.speed;
-    let i = SPEEDS.findIndex(x => x >= cur - 1e-6);
-    if (i < 0) i = SPEEDS.length - 1;
-    if (dir > 0) i = SPEEDS[i] > cur + 1e-6 ? i : Math.min(SPEEDS.length - 1, i + 1);
-    else i = Math.max(0, SPEEDS[i] < cur - 1e-6 ? i : i - 1);
-    saveSettings({ speed: SPEEDS[i] });
-  }
-
-  document.addEventListener('keydown', e => {
-    if (!current || e.ctrlKey || e.metaKey || e.altKey) return;
-    const t = e.target;
-    if (t instanceof Element && (t.closest('input, textarea, [contenteditable=""], [contenteditable="true"]'))) return;
-    if (e.key === '>' ) { stepSpeed(1); e.preventDefault(); }
-    else if (e.key === '<') { stepSpeed(-1); e.preventDefault(); }
-  }, true);
-
-  // --------------------------------------------------------------------- ui
-  const ui = {
-    host: null,
-    build() {
-      const host = document.createElement('readaloudplus-controls');
-      host.style.cssText = 'position:fixed;z-index:2147483646;left:50%;top:60px;transform:translateX(-50%);display:none;';
-      const root = host.attachShadow({ mode: 'open' });
-      root.innerHTML = `
-        <style>
-          :host { all: initial; }
-          .bar { display:flex; align-items:center; gap:2px; padding:4px; border-radius:999px;
-            font: 500 13px/1 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-            background: #2b2a27; color:#f5f4ef; box-shadow: 0 4px 18px rgba(0,0,0,.25); user-select:none; }
-          @media (prefers-color-scheme: light) { .bar { background:#ffffff; color:#1f1e1d; border:1px solid rgba(0,0,0,.12); } }
-          button { all:unset; cursor:pointer; min-width:28px; height:28px; padding:0 6px; border-radius:999px;
-            display:inline-flex; align-items:center; justify-content:center; box-sizing:border-box; }
-          button:hover { background: rgba(127,127,127,.18); }
-          button:focus-visible { outline:2px solid #d97757; outline-offset:1px; }
-          button[disabled] { opacity:.4; cursor:default; }
-          .speed { min-width:52px; font-variant-numeric: tabular-nums; }
-          .icon { width:16px; height:16px; }
-          .state { padding:0 8px 0 6px; opacity:.75; font-size:12px; }
-          .on { color:#d97757; }
-        </style>
-        <div class="bar" role="toolbar" aria-label="Read aloud speed">
-          <span class="state" aria-live="polite"></span>
-          <button class="slower" title="Slower (Shift+,)" aria-label="Slower">
-            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3.5 8h9"/></svg>
-          </button>
-          <button class="speed" title="Reset to 1×" aria-label="Playback speed"></button>
-          <button class="faster" title="Faster (Shift+.)" aria-label="Faster">
-            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3.5 8h9M8 3.5v9"/></svg>
-          </button>
-          <button class="hl" title="Toggle word highlighting" aria-label="Toggle word highlighting">
-            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M2.5 13.5h11"/><path d="M4.5 10.5 9.8 3.2a1 1 0 0 1 1.4-.2l1 .8a1 1 0 0 1 .2 1.4L7.3 12.5H4.5z"/></svg>
-          </button>
-        </div>`;
-      root.querySelector('.slower').addEventListener('click', () => stepSpeed(-1));
-      root.querySelector('.faster').addEventListener('click', () => stepSpeed(1));
-      root.querySelector('.speed').addEventListener('click', () => saveSettings({ speed: 1 }));
-      root.querySelector('.hl').addEventListener('click', () => saveSettings({ highlightWord: !settings.highlightWord }));
-      this.root = root;
-      this.host = host;
-      (document.body || document.documentElement).appendChild(host);
-    },
-    show() {
-      if (!settings.showControls) return;
-      if (!this.host || !this.host.isConnected) this.build();
-      this.host.style.display = 'block';
-      this.render();
-    },
-    hide() { if (this.host) this.host.style.display = 'none'; },
-    render() {
-      if (!this.root) return;
-      const smart = current ? current.mode === 'smart' : settings.smartSpeed;
-      const sp = this.root.querySelector('.speed');
-      sp.textContent = smart ? formatSpeed(settings.speed) : '1.0×';
-      this.root.querySelector('.slower').disabled = !smart || settings.speed <= SPEEDS[0];
-      this.root.querySelector('.faster').disabled = !smart || settings.speed >= SPEEDS[SPEEDS.length - 1];
-      sp.disabled = !smart;
-      sp.title = smart ? 'Reset to 1×' : 'Turn on "Smart speed" in the extension settings to change speed';
-      this.root.querySelector('.hl').classList.toggle('on', settings.highlightWord);
-      if (!settings.showControls) this.hide();
-    },
-    syncPaused() {
-      if (!this.root || !current?.ctx) return;
-      const label = current.ctx.state === 'suspended' ? 'Paused' : 'Reading';
-      const el = this.root.querySelector('.state');
-      if (el.textContent !== label) el.textContent = label;
-    },
-  };
-
-  const highlighter = new Highlighter();
-  highlighter.setColors(settings);
-  document.dispatchEvent(new CustomEvent('readaloudplus:hello'));
-
-  // Small debugging handle for the console.
-  window.__readAloudPlus = {
-    get session() { return current; },
-    settings,
-  };
 })();

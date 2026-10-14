@@ -7,6 +7,7 @@
   const SKIP_SELECTOR = [
     '.sr-only',
     '[data-testid="message-actions"]',
+    '.turn-action-controls',
     'button',
     'svg',
     'style',
@@ -43,6 +44,7 @@
       const root = this.root;
       const pieces = []; // { node, flatStart }
       let flat = '';
+      const breaks = []; // flat positions where a block boundary was inserted
       let lastBlock = null;
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
         acceptNode(n) {
@@ -65,13 +67,18 @@
             brs.delete(br);
           }
         }
-        if (flat && (block !== lastBlock || prevBr)) flat += ' ';
+        if (flat && (block !== lastBlock || prevBr)) { breaks.push(flat.length); flat += ' '; }
         lastBlock = block;
         pieces.push({ node: n, flatStart: flat.length });
         flat += n.nodeValue;
       }
       this.flat = flat;
       this.pieces = pieces;
+      // Same text with line breaks between blocks: what a TTS engine would
+      // read, for sites that don't tell us the spoken text.
+      const chars = flat.split('');
+      for (const b of breaks) chars[b] = '\n';
+      this.spokenText = chars.join('');
       // Tokens over the flat string, each resolved back to (node, offset) pairs.
       const tokens = [];
       const re = /\S+/g;

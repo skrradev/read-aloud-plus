@@ -58,3 +58,7 @@ npm test
 ```
 
 This runs the stretcher checks (both sample rates) and replays a captured real read-aloud session (`test/fixtures/sharding.json`) through the aligner. `node tools/make-icons.js` regenerates the icons.
+
+## License
+
+MIT. Not affiliated with Anthropic or OpenAI.
